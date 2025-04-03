@@ -121,7 +121,7 @@ def sample_by_interval(frame_count, interval=200):
 @torch.inference_mode()
 def infer(video_path):
 
-    max_frames_num = 64
+    max_frames_num = 24
     video,frame_time,video_time = load_video(video_path, max_frames_num, 1, force_sample=True)
     video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16().to(device)
     video = [video]
