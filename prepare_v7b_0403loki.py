@@ -66,11 +66,11 @@ model_name = "llava_qwen"
 device = "cuda"
 device_map = "auto"
 overwrite_config = {}
-# overwrite_config['mm_vision_tower'] = "/home/ubuntu/202502/siglip-so400m-patch14-384" 
+overwrite_config['mm_vision_tower'] = "/home/ubuntu/202502/siglip-so400m-patch14-384" 
 tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, torch_dtype="bfloat16", device_map=device_map, 
     overwrite_config=overwrite_config)  # Add any other thing you want to pass in llava_model_args
 model.eval()
-
+model = model.to(device)
 
 
 
@@ -123,7 +123,7 @@ def infer(video_path):
 
     max_frames_num = 64
     video,frame_time,video_time = load_video(video_path, max_frames_num, 1, force_sample=True)
-    video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().half()
+    video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16().to(device)
     video = [video]
     conv_template = "qwen_1_5"  # Make sure you use correct chat template for different models
     time_instruciton = f"The video lasts for {video_time:.2f} seconds, and {len(video[0])} frames are uniformly sampled from it. These frames are located at {frame_time}.Please answer the following questions related to this video."
