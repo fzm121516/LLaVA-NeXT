@@ -1,3 +1,18 @@
+
+CUDA_VISIBLE_DEVICES=1 python prepare_v7b_0403loki.py --cached-data-root /home/ubuntu/2025/loki --output-dir /home/ubuntu/2025/v7b_loki
+
+
+
+
+
+
+
+
+
+
+
+
+
 <p align="center" width="100%">
 <img src="https://i.postimg.cc/pL17YtG4/WX20240508-220230-2x.png"  width="80%" height="80%">
 </p>
