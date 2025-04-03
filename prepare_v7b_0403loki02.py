@@ -1,0 +1,248 @@
+import torch
+import os
+import argparse
+from tqdm import tqdm
+from PIL import Image
+import numpy as np
+from transformers import AutoProcessor
+from torchvision.transforms import Compose, CenterCrop, ToTensor, ToPILImage
+import os
+import torch
+from transformers import AutoModelForCausalLM, AutoProcessor
+import argparse
+import cv2
+import torch
+import numpy as np
+import random
+import torch
+import json
+import os
+from tqdm import tqdm
+import torch
+from transformers import AutoModel, AutoTokenizer
+import torch
+seed = 42
+torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+from llava.model.builder import load_pretrained_model
+from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IGNORE_INDEX
+from llava.conversation import conv_templates, SeparatorStyle
+from PIL import Image
+import requests
+import copy
+import torch
+import sys
+import warnings
+from decord import VideoReader, cpu
+import numpy as np
+
+
+warnings.filterwarnings("ignore")
+def load_video(video_path, max_frames_num,fps=1,force_sample=False):
+    if max_frames_num == 0:
+        return np.zeros((1, 336, 336, 3))
+    vr = VideoReader(video_path, ctx=cpu(0),num_threads=1)
+    total_frame_num = len(vr)
+    video_time = total_frame_num / vr.get_avg_fps()
+    fps = round(vr.get_avg_fps()/fps)
+    frame_idx = [i for i in range(0, len(vr), fps)]
+    frame_time = [i/fps for i in frame_idx]
+    if len(frame_idx) > max_frames_num or force_sample:
+        sample_fps = max_frames_num
+        uniform_sampled_frames = np.linspace(0, total_frame_num - 1, sample_fps, dtype=int)
+        frame_idx = uniform_sampled_frames.tolist()
+        frame_time = [i/vr.get_avg_fps() for i in frame_idx]
+    frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+    spare_frames = vr.get_batch(frame_idx).asnumpy()
+    # import pdb;pdb.set_trace()
+    return spare_frames,frame_time,video_time
+pretrained = "/home/ubuntu/202502/LLaVA-Video-7B-Qwen2"
+model_name = "llava_qwen"
+device = "cuda"
+device_map = "auto"
+overwrite_config = {}
+overwrite_config['mm_vision_tower'] = "/home/ubuntu/202502/siglip-so400m-patch14-384" 
+tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, torch_dtype="bfloat16", device_map=device_map, 
+    overwrite_config=overwrite_config)  # Add any other thing you want to pass in llava_model_args
+model.eval()
+model = model.to(device)
+
+
+
+
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cached-data-root', type=str, default='./data/dvf_recons', help='the data root for frames in the reconstruction structure')
+    parser.add_argument('--output-dir', type=str, default='./outputs/mm_representations', help='the output directory')
+    parser.add_argument('--output-fn', type=str, default='loki.json', help='the output file name')
+    return parser.parse_args()
+
+
+
+def get_dataset_meta(dataset_path):
+    fns = sorted(os.listdir(dataset_path))
+    meta = {}
+    for fn in fns:
+        data_id = fn.rsplit('_', maxsplit=1)[0]
+        if data_id not in meta:
+            meta[data_id] = 1
+        else:
+            meta[data_id] += 1
+    return meta
+
+
+
+def get_dataset_mp4(dataset_path):
+    # 获取目录下所有文件，并过滤出 .mp4 文件
+    mp4_files = sorted([fn for fn in os.listdir(dataset_path) if fn.endswith('.mp4')])
+    
+    # 返回绝对路径
+    return [os.path.join(dataset_path, fn) for fn in mp4_files]
+
+def sample_by_interval(frame_count, interval=200):
+    sampled_index = []
+    count = 1
+    while count <= frame_count:
+        sampled_index.append(count)
+        count += interval
+    return sampled_index
+
+
+
+
+
+
+@torch.inference_mode()
+def infer(video_path):
+    max_frames_num = 64
+    video, frame_time, video_time = load_video(video_path, max_frames_num, 1, force_sample=True)
+    video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16().to(device)
+    video = [video]
+    conv_template = "qwen_1_5"
+    
+    # 初始化对话
+    conv = copy.deepcopy(conv_templates[conv_template])
+    
+    # 第一轮对话
+    time_instruction = f"The video lasts for {video_time:.2f} seconds, and {len(video[0])} frames are uniformly sampled from it. These frames are located at {frame_time}. Please answer the following questions related to this video."
+    question1 = DEFAULT_IMAGE_TOKEN + f"\n{time_instruction}\nYou have been shown one video. Please analyze each frame of this video and check for any anomalies that indicate the video is not taken from the real world.\n."
+
+    conv.append_message(conv.roles[0], question1)
+    conv.append_message(conv.roles[1], None)
+    prompt_question1 = conv.get_prompt()
+    
+    input_ids1 = tokenizer_image_token(prompt_question1, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+    cont1 = model.generate(
+        input_ids1,
+        images=video,
+        modalities=["video"],
+        do_sample=False,
+        temperature=0,
+        max_new_tokens=4096,
+    )
+    text_outputs1 = tokenizer.batch_decode(cont1, skip_special_tokens=True)[0].strip()
+    print("第一轮回答:", text_outputs1)
+    
+    # 将第一轮回答添加到对话历史
+    conv.messages[-1][1] = text_outputs1
+    
+    # 第二轮对话 - 基于第一轮的回答继续提问
+    question2 = "You have been shown one video, which might be taken from real world or generated by an advanced AI model. \nBased on your previous analysis, is this video taken in the real world? (Answer yes if you think it is taken in the real world, and answer no otherwise.)\n."
+    conv.append_message(conv.roles[0], question2)
+    conv.append_message(conv.roles[1], None)
+    prompt_question2 = conv.get_prompt()
+    
+    input_ids2 = tokenizer_image_token(prompt_question2, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+    cont2 = model.generate(
+        input_ids2,
+        images=video,
+        modalities=["video"],
+        do_sample=False,
+        temperature=0,
+        max_new_tokens=4096,
+    )
+    text_outputs2 = tokenizer.batch_decode(cont2, skip_special_tokens=True)[0].strip()
+    print("第二轮回答:", text_outputs2)
+    
+    # 判断第一轮回答是否为"yes"
+    first_three_chars = text_outputs2.strip()[:3].lower()
+    bool_value = first_three_chars == "yes"
+    print("is_ai_generated:", bool_value)
+    
+    return text_outputs1, text_outputs2, bool_value
+
+
+if __name__ == '__main__':
+    config = parse_args().__dict__
+    output_dir = config['output_dir']
+    output_fn = config['output_fn']  # This should be your JSON output filename
+    input_data_root = config['cached_data_root']
+    cls_folder = sorted(os.listdir(input_data_root))
+    cls_folder = list(filter(lambda x: os.path.isdir(os.path.join(input_data_root, x)), cls_folder))
+    print(f'Find {len(cls_folder)} classes: {cls_folder}')
+    
+    # Initialize a list to store all JSON entries
+    json_output = []
+    
+    with torch.inference_mode():
+        for cls_idx, sub_cls in enumerate(cls_folder, 1):
+            # Directly process files in the class directory, skipping the label level
+            os.makedirs(os.path.join(output_dir, sub_cls), exist_ok=True)
+            
+            dataset_mp4 = get_dataset_mp4(os.path.join(input_data_root, sub_cls))
+            
+            for data_id in tqdm(dataset_mp4):
+                try:
+                    file_name = os.path.basename(data_id)
+                    file, _ = os.path.splitext(file_name)
+                    
+                    # Perform inference
+                    output1,output2,bool_value = infer(data_id)
+                    question2 = "You have been shown one video, which might be taken from real world or generated by an advanced AI model. \nIs this video taken in the real world? (Answer yes if you think it is taken in the real world, and answer no otherwise.)\n."
+    
+                    # Create JSON entry similar to your example
+                    entry = {
+                        "id": file,  # Using filename as ID
+                        "conversations": [
+                            {
+                                "from": "human",
+                                "value": "<image>\n" + question2  # Your question text
+                            },
+                            {
+                                "from": "gpt",
+                                "value": output2   # Your answer text
+                            }
+                        ],
+                        "data_source": sub_cls,  # Now just using sub_cls without label
+                        "video_path": data_id,  # Full video path or relative path
+                        "answer1": output1,
+                        "answer": output2
+                    }
+                    
+                    # Add to JSON output list
+                    json_output.append(entry)
+                    
+                    # Save tensor data if needed
+                    output_path = os.path.join(output_dir, sub_cls, f"{file}.pth")
+                    if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+                        result_dict = {
+                            "text1": output1,
+                            "bool_value": bool_value,
+                        }
+                        torch.save(result_dict, output_path)
+                
+                except Exception as e:
+                    print(f"Error processing video {data_id}: {e}")
+        
+            print(f'Finished {cls_idx}/{len(cls_folder)}')
+    
+        # Save the JSON output
+        with open(os.path.join(output_dir, output_fn), 'w') as f:
+            json.dump(json_output, f, indent=2)
+        print(f"JSON output saved to {os.path.join(output_dir, output_fn)}")
