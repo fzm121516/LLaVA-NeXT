@@ -1,18 +1,3 @@
-#    Copyright 2023 Haotian Liu
-#
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
-#
-#        http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
-
-
 from abc import ABC, abstractmethod
 
 import math
@@ -29,6 +14,8 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 from llava.mm_utils import get_anyres_image_grid_shape
 from llava.utils import rank0_print, rank_print
 import random
+import numpy as np
+from llava.model.merge import kth_bipartite_soft_matching, merge_wavg
 
 
 class LlavaMetaModel:
@@ -190,9 +177,9 @@ class LlavaMetaForCausalLM(ABC):
         return image_feature
 
     def encode_images(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
+        image_features = self.get_model().get_vision_tower()(images)  # [64, 3, 384, 384] -> [64, 729=27*27, 1152]
         # image_features = self.get_model().vision_resampler(image_features, images=images)
-        image_features = self.get_model().mm_projector(image_features)
+        image_features = self.get_model().mm_projector(image_features)  # [64, 729, 1152] -> [64, 729, 3584]
         return image_features
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
@@ -212,7 +199,7 @@ class LlavaMetaForCausalLM(ABC):
                 if self.config.add_faster_video:
                     cur_mm_spatial_pool_stride = cur_mm_spatial_pool_stride * 2
                     faster_video_feature = self.get_2dPool(feat,cur_mm_spatial_pool_stride)
-            if slower_img_feat is not 0:
+            if slower_img_feat != 0:
                 all_videos_or_images_features.append(slower_img_feat)
             else:
                 all_videos_or_images_features.append(feat)
@@ -225,9 +212,9 @@ class LlavaMetaForCausalLM(ABC):
         feature_dim = image_feature.shape[-1]
 
         image_feature = image_feature.view(num_frames, 1, resize_h, resize_h, -1)
-        image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-        image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-        image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+        image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()  # [3584, 64, 14, 1, 14]
+        image_feature = image_feature.flatten(1, 2).flatten(2, 3)  # [3584, 896, 14]
+        image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)  # [3584, 896, 15]
         if getattr(self.config, "add_faster_video", False):
             # import pdb; pdb.set_trace()
             # (3584, 832, 14) -> (3584, 64, 13, 14)
@@ -239,17 +226,170 @@ class LlavaMetaForCausalLM(ABC):
             # import pdb; pdb.set_trace()
             return image_feature
         # import pdb; pdb.set_trace()
-        image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+        image_feature = image_feature.flatten(1, 2).transpose(0, 1)  # [13440, 3584]
         return image_feature
+    
+    def add_token_per_grid_prune(self, image_features):
+
+        out = []
+        for image_feature in image_features:
+
+            image_feature = image_feature.unsqueeze(0)
+            resize_h = int(image_feature.shape[1])
+            resize_w = int(image_feature.shape[2])
+            num_frames = image_feature.shape[0]
+
+            image_feature = image_feature.view(num_frames, 1, resize_h, resize_w, -1)
+            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()  # [3584, 1, h, 1, w]
+            image_feature = image_feature.flatten(1, 2).flatten(2, 3)  # [3584, h * 1, w]
+            image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)  # [3584, h, w + 1]
+            image_feature = image_feature.flatten(1, 2).transpose(0, 1)  # [h * (w + 1), 3584]
+            out.append(image_feature)
+
+        out = torch.cat(out, dim=0)
+        return out
 
     def add_token_per_frame(self, image_feature):
         image_feature = image_feature.permute(2, 0, 1).contiguous()
         image_feature =  torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
+    
+    def scale_weights(self, weights, max_value):
+        weights = weights.copy()
+        excess = 0.0
+        for i in range(len(weights)):
+            if weights[i] > max_value:
+                excess += weights[i] - max_value
+                weights[i] = max_value
+        if excess > 0:
+            remaining_sum = weights.sum()
+            for i in range(len(weights)):
+                if weights[i] < max_value:
+                    weights[i] += (weights[i] / remaining_sum) * excess
+                    if weights[i] > max_value:
+                        excess += weights[i] - max_value
+                        weights[i] = max_value
+        # weights /= weights.sum()
+        return weights
+
+    # token compression implement
+    def token_compress(self, tensor, weights, total, max_token, version):
+        target_token_num = max_token * total
+        weights = np.array(weights)
+        weights /= weights.sum(axis=0, keepdims=True)
+        if version not in ["v1"]:
+            max_value = tensor.shape[1] / target_token_num  # max value of weight
+            weights = self.scale_weights(weights, max_value)  
+        out_list = []
+        for i in range(tensor.shape[0]):
+            cur_token = int(target_token_num * weights[i])
+            if cur_token <= 0:
+                continue
+            # v1: interpolate
+            if version == "v1":
+                target_height = target_width = int(math.sqrt(cur_token))
+                if target_height * target_width < cur_token:
+                    if (target_height + 1) * target_width <= cur_token:
+                        target_height += 1
+                    elif target_height * (target_width + 1) <= cur_token:
+                        target_width += 1
+                scaled_shape = [target_height, target_width]
+                # print(weights[i], cur_token, target_height, target_width)
+                height = width = self.get_vision_tower().num_patches_per_side
+                img_feat = tensor[i].view(height, width, -1)  # [27, 27, 3584]
+                img_feat = img_feat.permute(2, 0, 1).contiguous()  # [3584, 27, 27]
+                interpolated_tensor = torch.nn.functional.interpolate(img_feat.unsqueeze(0), size=scaled_shape, mode='bilinear')
+                interpolated_tensor = interpolated_tensor.squeeze(0).view(-1, target_height * target_width).permute(1, 0).contiguous()
+                out_list.append(interpolated_tensor.view(target_height, target_width, -1))
+
+            # v2: adaptive average pooling
+            elif version == "v2":
+                target_height = target_width = int(math.sqrt(cur_token))
+                if target_height * target_width < cur_token:
+                    if (target_height + 1) * target_width <= cur_token:
+                        target_height += 1
+                    elif target_height * (target_width + 1) <= cur_token:
+                        target_width += 1
+                height = width = self.get_vision_tower().num_patches_per_side
+                img_feat = tensor[i].view(height, width, -1)  # [27, 27, 3584]
+                img_feat = img_feat.permute(2, 0, 1).contiguous()  # [3584, 27, 27]
+                img_feat = torch.nn.functional.adaptive_avg_pool2d(img_feat, (target_height, target_width))
+                img_feat = img_feat.view(-1, target_height * target_width).permute(1, 0).contiguous()
+                out_list.append(img_feat.view(target_height, target_width, -1))
+
+            # v3: linspace
+            elif version == "v3":
+                select_idx = torch.linspace(0, tensor.shape[1] - 1, cur_token).long().tolist()
+                out_list.append(tensor[i][select_idx])
+
+            # v4: token merging
+            elif version == "v4":
+
+                img_feat = tensor[i].unsqueeze(0)
+                current_feature = img_feat
+                while current_feature.shape[1] > cur_token:
+                    r = current_feature.shape[1] - cur_token
+                    merge_func, _ = bipartite_soft_matching(current_feature, r, class_token=False, distill_token=False)
+                    current_feature, _ = merge_wavg(merge_func, current_feature)
+
+                img_feat = current_feature.squeeze(0)
+                out_list.append(img_feat)
+
+            # v5: bilinear with token merge
+            elif version == "v5":
+                
+                height = width = self.get_vision_tower().num_patches_per_side  # no pool
+                # height = width = 14  # pool
+                target_height = target_width = int(math.sqrt(cur_token))
+                if target_height * target_width < cur_token:
+                    if (target_height + 1) * target_width <= cur_token:
+                        target_height += 1
+                    elif target_height * (target_width + 1) <= cur_token:
+                        target_width += 1
+
+                tmp_list = []
+                
+                img_feat = tensor[i].view(height, width, -1)  # [27, 27, 3584]
+                for h in range(height):
+                    img_h = img_feat[h, :, :].unsqueeze(0)  # [1, 27, 3584]
+                    current_feature = img_h
+                    while current_feature.shape[1] > target_width:
+                        r = current_feature.shape[1] - target_width
+                        merge_func, _ = bipartite_soft_matching(current_feature, r, class_token=False, distill_token=False)
+                        current_feature, _ = merge_wavg(merge_func, current_feature)  # [1, target_height, 3584]
+
+                    tmp_list.append(current_feature.squeeze(0))  # [target_height, 3584]
+
+                img_feat = torch.stack(tmp_list, dim=0)  # [27, target_height, 3584]
+                tmp_list = []
+
+                for w in range(target_width):
+                    img_w = img_feat[:, w, :].unsqueeze(0)  # [1, 27, 3584]
+                    current_feature = img_w
+                    while current_feature.shape[1] > target_height:
+                        r = current_feature.shape[1] - target_height
+                        merge_func, _ = bipartite_soft_matching(current_feature, r, class_token=False, distill_token=False)
+                        current_feature, _ = merge_wavg(merge_func, current_feature)  # [1, target_width, 3584]
+
+                    tmp_list.append(current_feature.squeeze(0))
+
+                final_feat = torch.stack(tmp_list, dim=1)  # [target_height, target_width, 3584]
+                out_list.append(final_feat)
+
+        return out_list
 
     def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None):
         vision_tower = self.get_vision_tower()
+
+        # clip sim relative enhance
+        if getattr(self.config, "prune", False) and images is not None:
+            if len(images) == 2:
+                enhance_weights = images[1] 
+                images = images[0]
+            else:
+                enhance_weights = None
+
         # rank_print(modalities)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
@@ -285,7 +425,16 @@ class LlavaMetaForCausalLM(ABC):
             image_features = []
             for idx, image_feat in enumerate(encoded_image_features):
                 if idx in video_idx_in_batch:
-                    image_features.append(self.get_2dPool(image_feat))
+                    if getattr(self.config, "prune", False):
+                        if self.config.enhance_version in ["v4"]:
+                            image_feat = self.get_2dPool(image_feat)  # with pool for better perform 
+                        image_feat = self.token_compress(image_feat, enhance_weights, 
+                                                            total=self.config.enhance_total, 
+                                                            max_token=self.config.enhance_tokens,
+                                                            version=self.config.enhance_version)
+                        image_features.append(image_feat)
+                    else:
+                        image_features.append(self.get_2dPool(image_feat))  # [64, 196=14*14, 3584]
                 else:
                     image_features.append(image_feat)
             # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
@@ -311,7 +460,10 @@ class LlavaMetaForCausalLM(ABC):
                         # rank0_print("Video")
                         if mm_newline_position == "grid":
                             # Grid-wise
-                            image_feature = self.add_token_per_grid(image_feature)
+                            if getattr(self.config, "prune", False):  # v1, v2, v5
+                                image_feature = self.add_token_per_grid_prune(image_feature)
+                            else:
+                                image_feature = self.add_token_per_grid(image_feature)
                             if getattr(self.config, "add_faster_video", False):
                                 faster_video_feature = self.add_token_per_grid(all_faster_video_features[image_idx])
                                 # Add a token for each frame
@@ -336,7 +488,12 @@ class LlavaMetaForCausalLM(ABC):
                             
                         elif mm_newline_position == "one_token":
                             # one-token
-                            image_feature = image_feature.flatten(0, 1)
+                            if getattr(self.config, "prune", False):  # v3, v4, llava-ov
+                                for i in range(len(image_feature)):
+                                    image_feature[i] = image_feature[i].flatten(0, 1)  # for llava-ov
+                                image_feature = torch.cat(image_feature, dim=0)
+                            else:
+                                image_feature = image_feature.flatten(0, 1)
                             if 'unpad' in mm_patch_merge_type:
                                 image_feature = torch.cat((
                                     image_feature,
