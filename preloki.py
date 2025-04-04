@@ -41,7 +41,7 @@ def process_true_or_false_data(data):
         question_type = item["question_type"]
         parts = question_type.split("_")
         if len(parts) >= 6:  # 确保有足够的部分
-            real_fake = parts[5]  # 第三个_后的词
+            real_fake = parts[3]  # 第三个_后的词
             new_item = item.copy()
             if real_fake.lower() == "real":
                 new_item["answer"] = "Yes"
