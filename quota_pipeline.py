@@ -73,6 +73,7 @@ overwrite_config['prune'] = True
 overwrite_config["enhance_total"] = enhance_total
 overwrite_config["enhance_tokens"] = enhance_tokens
 overwrite_config["enhance_version"] = enhance_version
+overwrite_config['low_cpu_mem_usage'] = False
 tokenizer, model, image_processor, max_length = load_pretrained_model(
     "/home/ubuntu/202502/LLaVA-Video-7B-Qwen2", 
     None, 
