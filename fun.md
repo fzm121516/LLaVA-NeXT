@@ -20,9 +20,15 @@ pip install accelerate>=0.26.0
 
 
 
-python3 prepare_quota.py --cached-data-root=/data/lokivideo --output-dir=./output/quotaloki
+python3 preloki.py
 
-python3 prepare_quota040401.py --cached-data-root=/data/lokivideo --output-dir=./output/quotaloki040401
+python3 prepare_quota040401.py --cached-data-root=/data/loki --output-dir=./output/loki040401
 
 
-python3 lokitest2.py --loki_path=./output/quotaloki/loki.json
+python3 prepare_quota040402.py --cached-data-root=/data/loki --output-dir=./output/loki040402
+
+python3 lokitest2.py --loki_path=./output/loki040401/loki.json
+
+python3 lokitest.py --loki_path=./output/loki040402/loki.json
+
+

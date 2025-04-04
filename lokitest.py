@@ -22,27 +22,6 @@ def standardize_answer(answer):
         return "No"
     return answer  # 如果不符合上述情况，保持原样
 
-def standardize_answer_ab(answer):
-    """标准化答案格式"""
-    if answer is None:
-        return "No"  # 假设None表示No
-    
-    answer = str(answer).strip()
-    if not answer:  # 处理空字符串情况
-        return answer
-    
-    # 检查最后一个字符（考虑句号情况）
-    last_char = answer[-1].lower()
-    if last_char == "." and len(answer) >= 2:  # 如果以句号结尾，检查倒数第二个字符
-        last_char = answer[-2].lower()
-    
-    if last_char == "b":
-        return "Yes"
-    elif last_char == "a":
-        return "No"
-    
-    return answer  # 如果不符合上述情况，保持原样
-
 def process_true_or_false_data(data):
     """处理true_or_false数据：去重并根据question_type强制设置answer"""
     # 1. 去重 - 保留每个video_path第一次出现的条目
@@ -111,7 +90,7 @@ def compare_answers(loki_data, true_or_false_data):
             continue
             
         filename = extract_filename(item["video_path"])
-        loki_answer = standardize_answer_ab(item["answer"])
+        loki_answer = standardize_answer(item["answer"])
         
         if filename in truth_map:
             truth_answer = truth_map[filename]
