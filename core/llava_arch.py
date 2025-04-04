@@ -15,7 +15,7 @@ from llava.mm_utils import get_anyres_image_grid_shape
 from llava.utils import rank0_print, rank_print
 import random
 import numpy as np
-from llava.model.merge import kth_bipartite_soft_matching, merge_wavg
+from llava.model.merge import kth_bipartite_soft_matching, merge_wavg,bipartite_soft_matching
 
 
 class LlavaMetaModel:

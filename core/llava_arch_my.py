@@ -388,24 +388,29 @@ class LlavaMetaForCausalLM(ABC):
         return image_feature
     
     def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None):
+        # 获取视觉编码器（vision tower）
         vision_tower = self.get_vision_tower()
-        # rank_print(modalities)
+        # 如果没有视觉编码器或没有图像输入或输入序列长度为1，则直接返回原始输入
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
+        # 如果modalities是字符串，转换为列表
         if isinstance(modalities, str):
-            modalities = [modalities]
+            modalities = ["image"]
 
-        # import pdb; pdb.set_trace()
+        # 处理图像/视频输入（可能是列表或5维张量）
         if type(images) is list or images.ndim == 5:
+            # 如果是列表，确保每个元素是4维张量（批量维度）
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
 
+            # 记录视频模态在批次中的索引
             video_idx_in_batch = []
             for _ in range(len(modalities)):
                 if modalities[_] == "video":
                     video_idx_in_batch.append(_)
 
+            # 将所有图像拼接成一个张量
             images_list = []
             for image in images:
                 if image.ndim == 4:
@@ -415,121 +420,80 @@ class LlavaMetaForCausalLM(ABC):
 
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
+            
+            # 编码图像特征
             encoded_image_features = self.encode_images(concat_images)
-            # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
-
-            # This is a list, each element is [num_images, patch * patch, dim]
-            # rank_print(f"Concat images : {concat_images.shape}")
             encoded_image_features = torch.split(encoded_image_features, split_sizes)
+            
+            # 对视频模态应用2D池化
             image_features = []
             for idx, image_feat in enumerate(encoded_image_features):
                 if idx in video_idx_in_batch:
                     image_features.append(self.get_2dPool(image_feat))
                 else:
                     image_features.append(image_feat)
-            # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
-            # rank_print(f"Encoded image feats : {[x.shape for x in image_features]}")
-            # image_features = torch.split(image_features, split_sizes, dim=0)
+
+            # 获取配置参数
             mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
             image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
             mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
 
+            # 根据不同的patch合并类型处理图像特征
             if mm_patch_merge_type == "flat":
+                # 展平处理
                 image_features = [x.flatten(0, 1) for x in image_features]
-
             elif mm_patch_merge_type.startswith("spatial"):
                 new_image_features = []
                 for image_idx, image_feature in enumerate(image_features):
-                    # FIXME: now assume the image is square, and split to 2x2 patches
-                    # num_patches = h * w, where h = w = sqrt(num_patches)
-                    # currently image_feature is a tensor of shape (4, num_patches, hidden_size)
-                    # we want to first unflatten it to (2, 2, h, w, hidden_size)
-                    # rank0_print("At least we are reaching here")
-                    # import pdb; pdb.set_trace()
-                    if image_idx in video_idx_in_batch:  # video operations
-                        # rank0_print("Video")
+                    # 视频模态处理
+                    if image_idx in video_idx_in_batch:
                         if mm_newline_position == "grid":
-                            # Grid-wise
+                            # 网格级别添加token
                             image_feature = self.add_token_per_grid(image_feature)
-                            if getattr(self.config, "add_faster_video", False):
-                                faster_video_feature = self.add_token_per_grid(all_faster_video_features[image_idx])
-                                # Add a token for each frame
-                                concat_slow_fater_token = []
-                                # import pdb; pdb.set_trace()
-                                for _ in range(image_feature.shape[0]):
-                                    if _ % self.config.faster_token_stride == 0:
-                                        concat_slow_fater_token.append(torch.cat((image_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
-                                    else:
-                                        concat_slow_fater_token.append(torch.cat((faster_video_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
-                                # import pdb; pdb.set_trace()
-                                image_feature = torch.cat(concat_slow_fater_token)
-
-                                # print("!!!!!!!!!!!!")
-                        
                             new_image_features.append(image_feature)
                         elif mm_newline_position == "frame":
-                            # Frame-wise
+                            # 帧级别添加token
                             image_feature = self.add_token_per_frame(image_feature)
-
                             new_image_features.append(image_feature.flatten(0, 1))
-                            
                         elif mm_newline_position == "one_token":
-                            # one-token
+                            # 单token处理
                             image_feature = image_feature.flatten(0, 1)
                             if 'unpad' in mm_patch_merge_type:
                                 image_feature = torch.cat((
                                     image_feature,
                                     self.model.image_newline[None].to(image_feature.device)
                                 ), dim=0)
-                            new_image_features.append(image_feature)      
+                            new_image_features.append(image_feature)
                         elif mm_newline_position == "no_token":
                             new_image_features.append(image_feature.flatten(0, 1))
                         else:
                             raise ValueError(f"Unexpected mm_newline_position: {mm_newline_position}")
-                    elif image_feature.shape[0] > 1:  # multi patches and multi images operations
-                        # rank0_print("Single-images")
+                    # 多图像处理
+                    elif image_feature.shape[0] > 1:
                         base_image_feature = image_feature[0]
                         image_feature = image_feature[1:]
                         height = width = self.get_vision_tower().num_patches_per_side
                         assert height * width == base_image_feature.shape[0]
 
-                        if "anyres_max" in image_aspect_ratio:
-                            matched_anyres_max_num_patches = re.match(r"anyres_max_(\d+)", image_aspect_ratio)
-                            if matched_anyres_max_num_patches:
-                                max_num_patches = int(matched_anyres_max_num_patches.group(1))
-
+                        # 处理不同宽高比的图像
                         if image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
-                            if hasattr(self.get_vision_tower(), "image_size"):
-                                vision_tower_image_size = self.get_vision_tower().image_size
-                            else:
-                                raise ValueError("vision_tower_image_size is not found in the vision tower.")
+                            vision_tower_image_size = self.get_vision_tower().image_size
                             try:
                                 num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, vision_tower_image_size)
                             except Exception as e:
-                                rank0_print(f"Error: {e}")
                                 num_patch_width, num_patch_height = 2, 2
                             image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
                         else:
                             image_feature = image_feature.view(2, 2, height, width, -1)
 
+                        # 不同的特征合并策略
                         if "maxpool2x2" in mm_patch_merge_type:
                             image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
                             image_feature = image_feature.flatten(1, 2).flatten(2, 3)
                             image_feature = nn.functional.max_pool2d(image_feature, 2)
                             image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-                        elif "unpad" in mm_patch_merge_type and "anyres_max" in image_aspect_ratio and matched_anyres_max_num_patches:
-                            unit = image_feature.shape[2]
-                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                            image_feature = unpad_image(image_feature, image_sizes[image_idx])
-                            c, h, w = image_feature.shape
-                            times = math.sqrt(h * w / (max_num_patches * unit**2))
-                            if times > 1.1:
-                                image_feature = image_feature[None]
-                                image_feature = nn.functional.interpolate(image_feature, [int(h // times), int(w // times)], mode="bilinear")[0]
-                            image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
-                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
                         elif "unpad" in mm_patch_merge_type:
+                            # 处理未填充的图像
                             image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
                             image_feature = image_feature.flatten(1, 2).flatten(2, 3)
                             image_feature = unpad_image(image_feature, image_sizes[image_idx])
@@ -538,32 +502,27 @@ class LlavaMetaForCausalLM(ABC):
                         else:
                             image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
                             image_feature = image_feature.flatten(0, 3)
+                        
+                        # 是否包含基础特征
                         if "nobase" in mm_patch_merge_type:
                             pass
                         else:
                             image_feature = torch.cat((base_image_feature, image_feature), dim=0)
                         new_image_features.append(image_feature)
-                    else:  # single image operations
+                    # 单图像处理
+                    else:
                         image_feature = image_feature[0]
                         if "unpad" in mm_patch_merge_type:
                             image_feature = torch.cat((image_feature, self.model.image_newline[None]), dim=0)
-
                         new_image_features.append(image_feature)
                 image_features = new_image_features
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
+            # 单图像编码
             image_features = self.encode_images(images)
 
-        # TODO: image start / end is not implemented here to support pretraining.
-        if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
-            raise NotImplementedError
-        # rank_print(f"Total images : {len(image_features)}")
-
-        # Let's just add dummy tensors if they do not exist,
-        # it is a headache to deal with None all the time.
-        # But it is not ideal, and if you have a better idea,
-        # please open an issue / submit a PR, thanks.
+        # 处理标签、位置ID和注意力掩码
         _labels = labels
         _position_ids = position_ids
         _attention_mask = attention_mask
@@ -576,19 +535,21 @@ class LlavaMetaForCausalLM(ABC):
         if labels is None:
             labels = torch.full_like(input_ids, IGNORE_INDEX)
 
-        # remove the padding using attention_mask -- FIXME
+        # 根据注意力掩码去除填充部分
         _input_ids = input_ids
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
 
+        # 构建新的输入嵌入和标签
         new_input_embeds = []
         new_labels = []
         cur_image_idx = 0
-        # rank_print("Inserting Images embedding")
+        
+        # 遍历每个样本
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
-            # rank0_print(num_images)
             if num_images == 0:
+                # 没有图像token的情况
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
@@ -597,6 +558,7 @@ class LlavaMetaForCausalLM(ABC):
                 cur_image_idx += 1
                 continue
 
+            # 分割图像token和非图像部分
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
             cur_input_ids_noim = []
             cur_labels = labels[batch_idx]
@@ -604,12 +566,15 @@ class LlavaMetaForCausalLM(ABC):
             for i in range(len(image_token_indices) - 1):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i] + 1 : image_token_indices[i + 1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i] + 1 : image_token_indices[i + 1]])
+            
+            # 嵌入非图像部分的token
             split_sizes = [x.shape[0] for x in cur_labels_noim]
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
+            
+            # 构建最终的嵌入和标签序列
             cur_new_input_embeds = []
             cur_new_labels = []
-
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
@@ -623,26 +588,18 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
-
-            # import pdb; pdb.set_trace()
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
 
-        # Truncate sequences to max length as image embeddings can make the sequence longer
+        # 截断序列到最大长度
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
-        # rank_print("Finishing Inserting")
-
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
         new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
-        # TODO: Hard code for control loss spike
-        # if tokenizer_model_max_length is not None:
-        #     new_input_embeds = [x[:4096] if modality != "video" else x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
-        #     new_labels = [x[:4096] if modality != "video" else x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
 
-        # Combine them
+        # 填充序列到统一长度
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
 
@@ -650,8 +607,8 @@ class LlavaMetaForCausalLM(ABC):
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
         attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
         position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
-        # rank0_print("Prepare pos id")
 
+        # 根据填充方向（左或右）进行填充
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
             cur_len = cur_new_embed.shape[0]
             if getattr(self.config, "tokenizer_padding_side", "right") == "left":
@@ -668,8 +625,8 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
-        # rank0_print("tokenizer padding")
 
+        # 处理最终输出
         if _labels is None:
             new_labels = None
         else:
@@ -682,6 +639,8 @@ class LlavaMetaForCausalLM(ABC):
 
         if _position_ids is None:
             position_ids = None
+            
+        # 位置跳跃训练（如果启用）
         if getattr(self.config, "use_pos_skipping", False) and self.training:
             position_ids = torch.arange(new_input_embeds.size(1), device=new_input_embeds.device).unsqueeze(0).to(new_input_embeds.device)
             split_position = random.randint(0, new_input_embeds.size(1))
@@ -689,47 +648,86 @@ class LlavaMetaForCausalLM(ABC):
             right_add = random.randint(left_add, self.config.pos_skipping_range)
             position_ids[:, :split_position] += left_add
             position_ids[:, split_position:] += right_add
-        # import pdb; pdb.set_trace()
-        # rank0_print("Finish preparing")
+
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+    
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
+        """
+        初始化视觉相关的特殊token和嵌入层
+        
+        参数:
+            model_args: 包含模型配置参数的对象
+            tokenizer: 文本tokenizer对象
+        """
+        
+        # 1. 处理图像patch token
         if model_args.mm_use_im_patch_token:
+            # 添加默认的图像patch token到tokenizer中(作为特殊token)
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
+            # 调整token嵌入层的大小以匹配新的tokenizer词汇表大小
             self.resize_token_embeddings(len(tokenizer))
 
+        # 2. 处理图像开始/结束token
         if model_args.mm_use_im_start_end:
-            num_new_tokens = tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+            # 添加图像开始和结束token到tokenizer中
+            num_new_tokens = tokenizer.add_tokens(
+                [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], 
+                special_tokens=True
+            )
+            # 再次调整嵌入层大小
             self.resize_token_embeddings(len(tokenizer))
 
+            # 如果有新添加的token
             if num_new_tokens > 0:
+                # 获取输入和输出嵌入层的权重数据
                 input_embeddings = self.get_input_embeddings().weight.data
                 output_embeddings = self.get_output_embeddings().weight.data
 
+                # 计算现有token嵌入的平均值(用于初始化新token)
                 input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
                 output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
 
+                # 用平均值初始化新token的嵌入
                 input_embeddings[-num_new_tokens:] = input_embeddings_avg
                 output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
+            # 3. 微调MLP适配器相关设置
             if model_args.tune_mm_mlp_adapter:
+                # 设置输入嵌入层参数需要梯度(可训练)
                 for p in self.get_input_embeddings().parameters():
                     p.requires_grad = True
+                # 设置输出嵌入层参数不需要梯度(冻结)
                 for p in self.get_output_embeddings().parameters():
                     p.requires_grad = False
 
+            # 4. 加载预训练的MLP适配器权重
             if model_args.pretrain_mm_mlp_adapter:
+                # 从文件加载预训练权重
                 mm_projector_weights = torch.load(model_args.pretrain_mm_mlp_adapter, map_location="cpu")
                 embed_tokens_weight = mm_projector_weights["model.embed_tokens.weight"]
+                
+                # 确保新添加的token数量是2(开始和结束token)
                 assert num_new_tokens == 2
+                
+                # 处理不同形状的预训练权重
                 if input_embeddings.shape == embed_tokens_weight.shape:
+                    # 直接复制最后两个token的权重
                     input_embeddings[-num_new_tokens:] = embed_tokens_weight[-num_new_tokens:]
                 elif embed_tokens_weight.shape[0] == num_new_tokens:
+                    # 预训练权重只有新token的嵌入
                     input_embeddings[-num_new_tokens:] = embed_tokens_weight
                 else:
-                    raise ValueError(f"Unexpected embed_tokens_weight shape. Pretrained: {embed_tokens_weight.shape}. Current: {input_embeddings.shape}. Numer of new tokens: {num_new_tokens}.")
+                    # 形状不匹配时抛出错误
+                    raise ValueError(
+                        f"预训练权重形状不匹配。预训练: {embed_tokens_weight.shape}。"
+                        f"当前: {input_embeddings.shape}。新token数量: {num_new_tokens}。"
+                    )
+        
+        # 5. 仅使用图像patch token时的处理
         elif model_args.mm_use_im_patch_token:
             if model_args.tune_mm_mlp_adapter:
+                # 冻结输入和输出嵌入层的参数
                 for p in self.get_input_embeddings().parameters():
                     p.requires_grad = False
                 for p in self.get_output_embeddings().parameters():

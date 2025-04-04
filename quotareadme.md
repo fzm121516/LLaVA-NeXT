@@ -1,8 +1,16 @@
+
+
+
 export CUDA_HOME=/home/ubuntu/anaconda3/envs/vcsft/
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 export PYTHONPATH="$PYTHONPATH:/home/ubuntu/2025/sft"
+
+
+pip install flash-attn==2.3.6 --no-build-isolation
+
+pip install flash-attn --no-build-isolation
 
 conda create -n vcsft python=3.11
 pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121

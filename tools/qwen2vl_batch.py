@@ -9,12 +9,12 @@ max_pixels = 1280*28*28
 
 # Load the model in half-precision on the available device(s)
 model = Qwen2VLForConditionalGeneration.from_pretrained(
-    "/home/ubuntu/202502/Qwen2-VL-2B-Instruct",  
+    "/data/Qwen2-VL-2B-Instruct",  
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",
     device_map="auto"
 )
-processor = AutoProcessor.from_pretrained("/home/ubuntu/202502/Qwen2-VL-2B-Instruct", max_pixels=max_pixels)
+processor = AutoProcessor.from_pretrained("/data/Qwen2-VL-2B-Instruct", max_pixels=max_pixels)
 
 
 def frame_retrieve(frames, query_relation):

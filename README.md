@@ -1,4 +1,6 @@
 
+
+
 CUDA_VISIBLE_DEVICES=1 python prepare_v7b_0403loki.py --cached-data-root /home/ubuntu/2025/loki --output-dir /home/ubuntu/2025/v7b_loki
 
 CUDA_VISIBLE_DEVICES=1 python prepare_v7b_0403loki02.py --cached-data-root /home/ubuntu/2025/loki --output-dir /home/ubuntu/2025/v7b_loki02

@@ -51,7 +51,7 @@ def process_video_prune(video_path, max_frames_num, obj_list, query, additional_
     if len(obj_list) > 0:
         query_relation = "Does the image contain any object of " + ", ".join(obj_list) + "? A. yes, B. no\nAnswer with the option's letter directly."
     else:
-        query_relation = f"{query}\nDoes the image contain sufficient information to answer the given question? A. yes, B. no\nAnswer with the option's letter directly."
+        query_relation = f"{query}\nDoes the image contain any abnormal details that do not belong to the real world? A. yes, B. no. Answer with the option's letter directly."
     similarities = split_and_process(spare_frames, query_relation, batch_size=64)
     similarities_list.append(similarities)
     
@@ -59,8 +59,8 @@ def process_video_prune(video_path, max_frames_num, obj_list, query, additional_
 
 
 # --------------- Setting ---------------
-max_frames_num = 96  # base video frame
-additional_frames = 64  # maximum additional video frames
+max_frames_num = 24  # base video frame
+additional_frames = 16  # maximum additional video frames
 enhance_tokens = 196  # 27 * 27 = 576 -> pooling -> 14 * 14 = 196
 enhance_total = 64  # total tokens = enhance_tokens * enhance_total
 enhance_version = "v1"  # bilinear
@@ -68,14 +68,14 @@ weight_scale = [100, 2]
 
 device = "cuda"
 overwrite_config = {}
-overwrite_config['mm_vision_tower'] = "/home/ubuntu/202502/siglip-so400m-patch14-384" 
+overwrite_config['mm_vision_tower'] = "/data/siglip-so400m-patch14-384" 
 overwrite_config['prune'] = True
 overwrite_config["enhance_total"] = enhance_total
 overwrite_config["enhance_tokens"] = enhance_tokens
 overwrite_config["enhance_version"] = enhance_version
 overwrite_config['low_cpu_mem_usage'] = False
 tokenizer, model, image_processor, max_length = load_pretrained_model(
-    "/home/ubuntu/202502/LLaVA-Video-7B-Qwen2", 
+    "/data/LLaVA-Video-7B-Qwen2", 
     None, 
     "llava_qwen", 
     torch_dtype="bfloat16", 
@@ -95,7 +95,6 @@ def llava_inference(qs, video):
     conv.append_message(conv.roles[1], None)
     prompt_question = conv.get_prompt()
     input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
-    
     if video is not None:
         cont = model.generate(
             input_ids,
@@ -105,62 +104,68 @@ def llava_inference(qs, video):
             temperature=0,
             max_new_tokens=16,
             top_p=1.0,
-            num_beams=1
+            num_beams=1,
+            pad_token_id=tokenizer.eos_token_id
         )
-    else:
-        cont = model.generate(
-            input_ids,
-            images=video,
-            modalities= ["video"],
-            do_sample=False,
-            temperature=0,
-            max_new_tokens=4096,
-        )
+    # else:
+    #     cont = model.generate(
+    #         input_ids,
+    #         images=video,
+    #         modalities= ["video"],
+    #         do_sample=False,
+    #         temperature=0,
+    #         max_new_tokens=4096,
+    #     )
     
     text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip()
     return text_outputs
 
 print(f"---------------Frames: {max_frames_num}-----------------")
 print("-----total: " + str(overwrite_config["enhance_total"]) + "----tokens: " + str(overwrite_config["enhance_tokens"]) + "----version: " + overwrite_config["enhance_version"] + "-----")
-video_path ="/home/ubuntu/2025/DVF_tiny/DVF_tiny/DVF_tiny/pika/1_fake/Cinematic_medium_shot_of_a_tiger_walking_in_the_jungle__soft_lighting__4k__sharp__Canon_C300__depth__seed7129231733499100_upscaled.mp4"
+
 # data_path = "path/to/your/video"
-query = "What's the man doing on the bed? A. jumping. B. sleeping. C. eating."
+query = "You have been shown one video. Please analyze each frame of this video and check for any anomalies that indicate the video is not taken from the real world."
 
-retrieve_pmt_0 = query 
-retrieve_pmt_0 += '''\nTo answer this question, please follow the following step to give an object list for object detection.
-    Step 1: Do you think it is necessary to detect specific physical entities in the video? Please only answer "yes" or "no" in this step.
-    Step 2: If 'yes' in previous step, then what object in the video do you think needs to be detected to answer this question? Please only output the name of all the objects need to detect in the form of a Python list without other information.
-    Step 3: Filter the object list provided in step 2, make sure they are physical entities, not abstract concepts. Please only output the name of the filtered object in the form of a Python list without other information. If all the words being filtered, please only output null.
-    # Example 1:
-    Question: How many blue balloons are over the long table in the middle of the room at the end of this video? A. 1. B. 2. C. 3. D. 4.
-    Your output should be:
-    Step 1: yes
-    Step 2: ["blue ballons", "long table", "video", "blue"]
-    Step 3: ["blue ballons", "long table"]
-    # Example 2:
-    Question: In the lower left corner of the video, what color is the woman wearing on the right side of the man in black clothes? A. Blue. B. White. C. Red. D. Yellow.
-    Your output should be:
-    Step 1: yes
-    Step 2: ["the man in black", "woman", "lower left corner"]
-    Step 3: ["the man in black", "woman"]
-    # Example 3:
-    Question: In which country is the comedy featured in the video recognized worldwide? A. China. B. UK. C. Germany. D. United States.
-    Your output should be:
-    Step 1: no'''
-            
-out = llava_inference(retrieve_pmt_0, None)
-step1_match = re.search(r'step 1: (yes|no)', out.lower())
-if step1_match and step1_match.group(1) == 'yes':
-    step3_match = re.search(r'step 3: (\[[^\]]*\])', out.lower())
-    if step3_match:
-        final_object = eval(step3_match.group(1))
+# retrieve_pmt_0 = query 
+# retrieve_pmt_0 += '''\nTo answer this question, please follow the following step to give an object list for object detection.
+#     Step 1: Do you think it is necessary to detect specific physical entities in the video? Please only answer "yes" or "no" in this step.
+#     Step 2: If 'yes' in previous step, then what object in the video do you think needs to be detected to answer this question? Please only output the name of all the objects need to detect in the form of a Python list without other information.
+#     Step 3: Filter the object list provided in step 2, make sure they are physical entities, not abstract concepts. Please only output the name of the filtered object in the form of a Python list without other information. If all the words being filtered, please only output null.
+#     # Example 1:
+#     Question: How many blue balloons are over the long table in the middle of the room at the end of this video? A. 1. B. 2. C. 3. D. 4.
+#     Your output should be:
+#     Step 1: yes
+#     Step 2: ["blue ballons", "long table", "video", "blue"]
+#     Step 3: ["blue ballons", "long table"]
+#     # Example 2:
+#     Question: In the lower left corner of the video, what color is the woman wearing on the right side of the man in black clothes? A. Blue. B. White. C. Red. D. Yellow.
+#     Your output should be:
+#     Step 1: yes
+#     Step 2: ["the man in black", "woman", "lower left corner"]
+#     Step 3: ["the man in black", "woman"]
+#     # Example 3:
+#     Question: In which country is the comedy featured in the video recognized worldwide? A. China. B. UK. C. Germany. D. United States.
+#     Your output should be:
+#     Step 1: no'''
 
+# out = llava_inference(retrieve_pmt_0, None)
+# step1_match = re.search(r'step 1: (yes|no)', out.lower())
+# if step1_match and step1_match.group(1) == 'yes':
+#     step3_match = re.search(r'step 3: (\[[^\]]*\])', out.lower())
+#     if step3_match:
+#         final_object = eval(step3_match.group(1))
+
+
+video_path ="/data/loki/video/045bfd1b-7cd3-5171-9afe-959a75d42756.mp4"
+final_object=[]
 frames, frame_time, video_time, score_list = process_video_prune(video_path, max_frames_num, final_object, query, additional_frames, force_sample=True)
 q_num = 0  # 添加这行
 video = image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].cuda().bfloat16()
 weights = [(w * weight_scale[0]) ** weight_scale[1] for w in score_list[q_num]]
 video = [[video], weights]
-qs = "Select the best answer to the following multiple-choice question based on the video. Respond with only the letter (A, B, C, or D) of the correct option. Question: " + query + '\nThe best answer is:'
+qs = "You have been shown one video, which might be taken from real world or generated by an advanced AI model. \nIs this video taken in the real world? (Answer yes if you think it is taken in the real world, and answer no otherwise.)\n."
 res = llava_inference(qs, video)
 
 print(res)
+
+
