@@ -18,12 +18,12 @@ pip install open_clip_torch
 
 pip install accelerate>=0.26.0
 
+python3 lokitest.py --loki_path=/data/LLaVA-NeXT/output/quotaloki/loki.json
 
 
 python3 preloki.py
 
 python3 prepare_quota040401.py --cached-data-root=/data/loki --output-dir=./output/loki040401
-
 
 python3 prepare_quota040402.py --cached-data-root=/data/loki --output-dir=./output/loki040402
 

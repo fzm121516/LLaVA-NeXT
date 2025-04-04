@@ -13,8 +13,6 @@ def extract_filename(video_path):
 
 def standardize_answer(answer):
     """标准化答案格式"""
-    if answer is None:
-        return "No"  # 假设None表示No
     answer = str(answer).strip()
     if answer.lower().startswith("yes"):
         return "Yes"
@@ -46,7 +44,7 @@ def process_true_or_false_data(data):
         question_type = item["question_type"]
         parts = question_type.split("_")
         if len(parts) >= 6:  # 确保有足够的部分
-            real_fake = parts[5]  # 第三个_后的词
+            real_fake = parts[3]  # 第三个_后的词
             new_item = item.copy()
             if real_fake.lower() == "real":
                 new_item["answer"] = "Yes"
@@ -80,10 +78,14 @@ def compare_answers(loki_data, true_or_false_data):
     
     total = 0
     correct = 0
+    real_total = 0
+    real_correct = 0
+    fake_total = 0
+    fake_correct = 0
     results = []  # 存储所有比较结果
     
     # 用于子集统计
-    subset_stats = defaultdict(lambda: {'total': 0, 'correct': 0})
+    subset_stats = defaultdict(lambda: {'total': 0, 'correct': 0, 'real_total': 0, 'real_correct': 0, 'fake_total': 0, 'fake_correct': 0})
     
     for item in loki_data:
         if "video_path" not in item or "answer" not in item:
@@ -98,6 +100,16 @@ def compare_answers(loki_data, true_or_false_data):
             is_correct = loki_answer == truth_answer
             if is_correct:
                 correct += 1
+            
+            # 统计真实视频和合成视频的准确率
+            if truth_answer == "Yes":
+                real_total += 1
+                if is_correct:
+                    real_correct += 1
+            elif truth_answer == "No":
+                fake_total += 1
+                if is_correct:
+                    fake_correct += 1
             
             # 记录结果
             result = {
@@ -115,6 +127,16 @@ def compare_answers(loki_data, true_or_false_data):
                 subset_stats[subset]['total'] += 1
                 if is_correct:
                     subset_stats[subset]['correct'] += 1
+                
+                # 更新子集的真实/合成视频统计
+                if truth_answer == "Yes":
+                    subset_stats[subset]['real_total'] += 1
+                    if is_correct:
+                        subset_stats[subset]['real_correct'] += 1
+                elif truth_answer == "No":
+                    subset_stats[subset]['fake_total'] += 1
+                    if is_correct:
+                        subset_stats[subset]['fake_correct'] += 1
             
             results.append(result)
         else:
@@ -122,16 +144,27 @@ def compare_answers(loki_data, true_or_false_data):
     
     if total > 0:
         accuracy = correct / total * 100
+        real_accuracy = real_correct / real_total * 100 if real_total > 0 else 0
+        fake_accuracy = fake_correct / fake_total * 100 if fake_total > 0 else 0
+        
         print(f"\n总计比较: {total}")
         print(f"正确数量: {correct}")
-        print(f"准确率: {accuracy:.2f}%")
+        print(f"总体准确率: {accuracy:.2f}%")
+        print(f"\n真实视频(Yes)统计: 数量={real_total}, 正确={real_correct}, 准确率={real_accuracy:.2f}%")
+        print(f"合成视频(No)统计: 数量={fake_total}, 正确={fake_correct}, 准确率={fake_accuracy:.2f}%")
         
         # 打印子集统计信息
         if subset_stats:
             print("\n子集统计:")
             for subset, stats in subset_stats.items():
                 subset_accuracy = (stats['correct'] / stats['total'] * 100) if stats['total'] > 0 else 0
-                print(f"子集 '{subset}': 数量={stats['total']}, 正确={stats['correct']}, 准确率={subset_accuracy:.2f}%")
+                subset_real_accuracy = (stats['real_correct'] / stats['real_total'] * 100) if stats['real_total'] > 0 else 0
+                subset_fake_accuracy = (stats['fake_correct'] / stats['fake_total'] * 100) if stats['fake_total'] > 0 else 0
+                
+                print(f"\n子集 '{subset}':")
+                print(f"  总计: 数量={stats['total']}, 正确={stats['correct']}, 准确率={subset_accuracy:.2f}%")
+                print(f"  真实视频: 数量={stats['real_total']}, 正确={stats['real_correct']}, 准确率={subset_real_accuracy:.2f}%")
+                print(f"  合成视频: 数量={stats['fake_total']}, 正确={stats['fake_correct']}, 准确率={subset_fake_accuracy:.2f}%")
         
         # 打印所有比较结果，按正确性分组
         print("\n所有比较结果:")
@@ -145,17 +178,6 @@ def compare_answers(loki_data, true_or_false_data):
             subset_info = f", 子集: {result['subset']}" if 'subset' in result else ""
             print(f"文件名: {result['filename']}{subset_info} - Loki: {result['loki_answer']}, 真实: {result['truth_answer']}")
 
-
-        print(f"\n总计比较: {total}")
-        print(f"正确数量: {correct}")
-        print(f"准确率: {accuracy:.2f}%")
-        
-        # 打印子集统计信息
-        if subset_stats:
-            print("\n子集统计:")
-            for subset, stats in subset_stats.items():
-                subset_accuracy = (stats['correct'] / stats['total'] * 100) if stats['total'] > 0 else 0
-                print(f"子集 '{subset}': 数量={stats['total']}, 正确={stats['correct']}, 准确率={subset_accuracy:.2f}%")
     else:
         print("没有可比较的数据")
 
@@ -215,5 +237,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
